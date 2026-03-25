@@ -14,39 +14,87 @@ triton_patch_sort = importlib.import_module("triton.triton_patch.language.standa
 _MAX_ASCEND_TRITON_TOPK = 256
 
 @triton.jit
-def _float_to_sortable_i32(x):
-    bits = x.to(tl.int32, bitcast=True)
-    sign_bit = tl.full(bits.shape, -2147483648, tl.int32)
-    return tl.where(bits < 0, (~bits) ^ sign_bit, bits)
+def _float_to_sortable_int(x):
+    if x.dtype == tl.float32:
+        bits = x.to(tl.int32, bitcast=True)
+        sign_bit = tl.full(bits.shape, -0x80000000, tl.int32)
+        return tl.where(bits < 0, (~bits) ^ sign_bit, bits)
+    else:  # float16
+        bits = x.to(tl.int16, bitcast=True)
+        sign_bit = tl.full(bits.shape, -0x8000, tl.int16)
+        return tl.where(bits < 0, (~bits) ^ sign_bit, bits)
 
 
 @triton.jit
-def _sortable_i32_to_float(sortable):
-    sign_bit = tl.full(sortable.shape, -2147483648, tl.int32)
-    bits = tl.where(sortable >= 0, sortable, ~(sortable ^ sign_bit))
-    return bits.to(tl.float32, bitcast=True)
-
+def _sortable_int_to_float(sortable, float_dtype):
+    if float_dtype == tl.float32:
+        sign_bit = tl.full(sortable.shape, -0x80000000, tl.int32)
+        bits = tl.where(sortable >= 0, sortable, ~(sortable ^ sign_bit))
+        return bits.to(tl.float32, bitcast=True)
+    else:  # float16
+        sign_bit = tl.full(sortable.shape, -0x8000, tl.int16)
+        bits = tl.where(sortable >= 0, sortable, ~(sortable ^ sign_bit))
+        return bits.to(tl.float16, bitcast=True)
 
 @triton.jit
 def _pack_sort_keys(values, indices):
-    max_u32 = tl.full(values.shape, 4294967295, tl.int64)
-    sortable = _float_to_sortable_i32(values).to(tl.int64)
-    tie = max_u32 - indices.to(tl.int64)
-    return (sortable << 32) | tie
-
+    if values.dtype == tl.float16:
+        sortable = _float_to_sortable_int(values).to(tl.int32)
+        if indices.dtype == tl.int16:
+            tie = tl.full(indices.shape, 0xFFFF, tl.int32) - indices.to(tl.int32)
+            return (sortable << 16) | tie
+        elif indices.dtype == tl.int8:
+            tie = tl.full(indices.shape, 0xFF, tl.int32) - indices.to(tl.int32)
+            return (sortable << 8) | tie
+        else:
+            sortable = sortable.to(tl.int64)
+            tie = tl.full(indices.shape, 0xFFFFFFFF, tl.int64) - indices.to(tl.int64)
+            return (sortable << 32) | tie
+    else:
+        sortable = _float_to_sortable_int(values).to(tl.int64)
+        if indices.dtype == tl.int32:
+            tie = tl.full(indices.shape, 0xFFFFFFFF, tl.int64) - indices.to(tl.int64)
+            return (sortable << 32) | tie
+        elif indices.dtype == tl.int16:
+            tie = tl.full(indices.shape, 0xFFFF, tl.int64) - indices.to(tl.int64)
+            return (sortable << 32) | tie
+        else:
+            tie = tl.full(indices.shape, 0xFF, tl.int64) - indices.to(tl.int64)
+            return (sortable << 32) | tie
 
 @triton.jit
-def _unpack_sort_values(keys):
-    sortable = (keys >> 32).to(tl.int32)
-    return _sortable_i32_to_float(sortable)
-
+def _unpack_sort_values(keys, float_dtype, idx_dtype):
+    if float_dtype == tl.float16:
+        if idx_dtype == tl.int16:
+            sortable = (keys >> 16).to(tl.int16)
+        elif idx_dtype == tl.int8:
+            sortable = (keys >> 8).to(tl.int16)
+        else:
+            shift = 32
+            sortable = (keys >> shift).to(tl.int16)
+    else:
+        shift = 32
+        sortable = (keys >> shift).to(tl.int32)
+            
+    return _sortable_int_to_float(sortable, float_dtype)
 
 @triton.jit
-def _unpack_sort_indices(keys):
-    max_u32 = tl.full(keys.shape, 4294967295, tl.int64)
-    return (max_u32 - (keys & max_u32)).to(tl.int32)
+def _unpack_sort_indices(keys, idx_dtype):
+    if keys.dtype == tl.int32:
+        if idx_dtype == tl.int16:
+            max_tensor = tl.full(keys.shape, 0xFFFF, tl.int32)
+        else:
+            max_tensor = tl.full(keys.shape, 0xFF, tl.int32)
+        return (max_tensor - (keys & max_tensor)).to(idx_dtype)
+    else:
+        if idx_dtype == tl.int32:
+            max_tensor = tl.full(keys.shape, 0xFFFFFFFF, tl.int64)
+        elif idx_dtype == tl.int16:
+            max_tensor = tl.full(keys.shape, 0xFFFF, tl.int64)
+        else:
+            max_tensor = tl.full(keys.shape, 0xFF, tl.int64)
+        return (max_tensor - (keys & max_tensor)).to(idx_dtype)
 
-@libentry()
 @triton.jit
 def _streaming_topk_kernel(
     x_ptr,
@@ -82,7 +130,7 @@ def _streaming_topk_kernel(
             mask=mask_m & mask_n,
             other=float("-inf"),
         )
-        idx = tl.broadcast_to(offs_n[None, :], x.shape).to(tl.int32)
+        idx = tl.broadcast_to(offs_n[None, :], x.shape).to(y_idx_ptr.type.element_ty)
         keys = _pack_sort_keys(x, idx)
         acc = triton_patch_topk(keys, K_PAD, dim=1)
         for _ in (tl.static_range if loop_iterations <= 4 else range)(loop_iterations):
@@ -95,38 +143,35 @@ def _streaming_topk_kernel(
                 mask=mask_m & mask_n,
                 other=float("-inf"),
             )
-            idx = tl.broadcast_to(offs_n[None, :], x.shape).to(tl.int32)
+            idx = tl.broadcast_to(offs_n[None, :], x.shape).to(y_idx_ptr.type.element_ty)
             keys = _pack_sort_keys(x, idx)
             cand = triton_patch_topk(keys, K_PAD, dim=1)
             acc = tl.maximum(acc, cand)
 
         acc = triton_patch_topk(acc, K_PAD, dim=1)
 
-        y_vals = _unpack_sort_values(acc)
-        y_indices = _unpack_sort_indices(acc)
-        # y_vals = tl.full([BLOCK_M, K_PAD], 1.0, dtype=tl.float32)
-        # y_indices = tl.full([BLOCK_M, K_PAD], 1, dtype=tl.int32)
+        y_vals = _unpack_sort_values(acc, x_ptr.type.element_ty, y_idx_ptr.type.element_ty)
+        y_indices = _unpack_sort_indices(acc, y_idx_ptr.type.element_ty)
         
         tl.store(
-            y_val_ptr + offs_m[:, None] * stride_ym + offs_k[None, :] * 4,
+            y_val_ptr + offs_m[:, None] * stride_ym + offs_k[None, :],
             y_vals,
             mask=(offs_m[:, None] < n_rows) & (offs_k[None, :] < K_PAD),
         )
         tl.store(
-            y_idx_ptr + offs_m[:, None] * stride_ym + offs_k[None, :] * 4,
+            y_idx_ptr + offs_m[:, None] * stride_ym + offs_k[None, :],
             y_indices,
             mask=(offs_m[:, None] < n_rows) & (offs_k[None, :] < K_PAD),
         )
 
-def top_k_sampling_impl(
-    logits: torch.FloatTensor,
+def top_k_impl(
+    logits: torch.Tensor,
     top_k: int = 50,
     filter_value: float = -float("Inf"),
     min_tokens_to_keep: int = 1,
     largest = True
 ) -> tuple[torch.Tensor, torch.Tensor]:
     device = logits.device
-    logits = logits.to(torch.float32)
 
     vocab_size = logits.size(-1)
     batch_size = logits.numel() // vocab_size
@@ -148,8 +193,17 @@ def top_k_sampling_impl(
     while n_cols_pad % block_n != 0:
         block_n //= 2
 
+    if vocab_size <= 128:
+        idx_dtype = torch.int8
+    elif vocab_size <= 32768:
+        idx_dtype = torch.int16
+    elif vocab_size <= 2147483648:
+        idx_dtype = torch.int32
+    else:
+        idx_dtype = torch.int64
+
     topk_vals_pad = torch.empty((batch_size, k_pad), device=device, dtype=torch.float32)
-    topk_idx_pad = torch.empty((batch_size, k_pad), device=device, dtype=torch.int32)
+    topk_idx_pad = torch.empty((batch_size, k_pad), device=device, dtype=idx_dtype)
 
     num_programs = triton.runtime.driver.active.utils.get_device_properties("npu")["num_vectorcore"]
     
@@ -169,16 +223,30 @@ def top_k_sampling_impl(
 
     final_candidate_vals = topk_vals_pad[:, :top_k].contiguous()
     final_candidate_idx = topk_idx_pad[:, :top_k].contiguous()
-
     if not largest:
         final_candidate_vals = -final_candidate_vals
-
     final_probs_dist = torch.softmax(final_candidate_vals, dim=-1)
-    select_index = torch.multinomial(final_probs_dist, num_samples=1)
-    stage2_out_prob = torch.gather(final_probs_dist, dim=-1, index=select_index)
-    stage2_out_token = torch.gather(final_candidate_idx, dim=-1, index=select_index)
 
-    return stage2_out_prob, stage2_out_token
+    return final_probs_dist, final_candidate_idx
+
+def top_k_sampling_impl(
+    logits: torch.Tensor,
+    top_k: int = 50,
+    filter_value: float = -float("Inf"),
+    min_tokens_to_keep: int = 1,
+    largest = True
+) -> tuple[torch.Tensor, torch.Tensor]:
+    probs, indices = top_k_impl(
+        logits=logits,
+        top_k=top_k,
+        filter_value=filter_value,
+        min_tokens_to_keep=min_tokens_to_keep,
+        largest=largest
+    )
+    select_index = torch.multinomial(probs, num_samples=1)
+    next_token = torch.gather(indices, dim=-1, index=select_index)
+    next_prob = torch.gather(probs, dim=-1, index=select_index)
+    return next_prob, next_token
 
 
 @triton.jit
