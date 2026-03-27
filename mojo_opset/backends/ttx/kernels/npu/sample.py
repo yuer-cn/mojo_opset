@@ -7,8 +7,6 @@ import triton.language.core as core
 from triton.runtime.libentry import libentry
 from triton.language.standard import _log2, zeros_like
 
-_MAX_ASCEND_TRITON_TOPK = 256
-
 # TODO: Streaming verson implement still have some issues, need to be fixed and re-enabled.
 
 # triton_patch_topk = importlib.import_module("triton.triton_patch.language.standard").topk
@@ -503,11 +501,6 @@ def top_k_sampling_impl(
     
     top_k = min(top_k, vocab_size)
     top_k = max(top_k, min_tokens_to_keep)
-
-    if top_k > _MAX_ASCEND_TRITON_TOPK:
-        raise NotImplementedError(
-            f"TTX Triton TopKSampling on Ascend does not yet support top_k > {_MAX_ASCEND_TRITON_TOPK} due Triton-NPU compile limits."
-        )
     
     descending = 1 if largest else 0
     

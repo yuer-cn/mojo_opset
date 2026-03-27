@@ -4,35 +4,9 @@ import torch
 from mojo_opset import MojoJoinProbRejectSampling
 from mojo_opset import MojoRejectSampling
 from mojo_opset import MojoTopPFilter
-from mojo_opset import MojoTopPSampling
 from mojo_opset import MojoTopKSampling
-
 from tests.utils import auto_switch_platform
 from tests.utils import bypass_not_implemented
-from mojo_opset import MojoTopPSampling
-from mojo_opset import MojoTopKSampling
-
-
-
-@pytest.mark.parametrize(
-    "logits, topk, topp, min_tokens_to_keep",
-    [
-        (torch.randn(120, 151936), 1000, 0.7, 1),
-        (torch.randn(15, 155136), 100, 0.7, 1),
-        (torch.randn(18, 155136), 100, 0.7, 1),
-    ],
-)
-@auto_switch_platform(set_perf=True)
-@bypass_not_implemented
-def test_topp_filter(logits, topk, topp, min_tokens_to_keep):
-    top_p_filter = MojoTopPFilter()
-    top_p_filter_ref = MojoTopPFilter._registry.get("torch")()
-
-    perf(
-        lambda: top_p_filter(logits, topp, min_tokens_to_keep, topk),
-        reference_executor=lambda: top_p_filter_ref(logits, topp, min_tokens_to_keep, topk),
-    )  # noqa: F821
-
 
 @pytest.mark.parametrize(
     "logits, topk, min_tokens_to_keep",
@@ -48,10 +22,23 @@ def test_topk_sampling(logits, topk, min_tokens_to_keep):
     top_k_sampling = MojoTopKSampling(top_k=topk, min_tokens_to_keep=min_tokens_to_keep)
     top_k_sampling_ref = MojoTopKSampling._registry.get("torch")(top_k=topk, min_tokens_to_keep=min_tokens_to_keep)
 
-    perf(
-        lambda: top_k_sampling(logits),
-        reference_executor=lambda: top_k_sampling_ref(logits),
-    )  # noqa: F821
+    perf(lambda: top_k_sampling(logits))  # noqa: F821
+
+
+@pytest.mark.parametrize(
+    "logits, topk, topp, min_tokens_to_keep",
+    [
+        (torch.randn(120, 151936), 1000, 0.7, 1),
+        (torch.randn(15, 155136), 100, 0.7, 1),
+        (torch.randn(18, 155136), 100, 0.7, 1),
+    ],
+)
+@auto_switch_platform(set_perf=True)
+@bypass_not_implemented
+def test_topp_filter(logits, topk, topp, min_tokens_to_keep):
+    top_p_filter = MojoTopPFilter()
+
+    perf(lambda: top_p_filter(logits, topp, min_tokens_to_keep, topk))  # noqa: F821
 
 
 @pytest.mark.parametrize(
@@ -71,12 +58,8 @@ def test_reject_sampling(target_logits, draft_tokens, draft_probs, spec_step):
     torch.manual_seed(42)
 
     reject_sampling = MojoRejectSampling()
-    ref_reject_sampling = MojoRejectSampling._registry.get("torch")()
 
-    perf(
-        lambda: reject_sampling(target_logits, draft_tokens, draft_probs),
-        reference_executor=lambda: ref_reject_sampling(target_logits, draft_tokens, draft_probs),
-    )  # noqa: F821
+    perf(lambda: reject_sampling(target_logits, draft_tokens, draft_probs))  # noqa: F821
 
 
 @pytest.mark.parametrize(
@@ -98,9 +81,5 @@ def test_magic_reject_sampling(target_logits, draft_tokens, draft_probs, spec_st
     torch.manual_seed(42)
 
     reject_sampling = MojoJoinProbRejectSampling()
-    ref_reject_sampling = MojoJoinProbRejectSampling._registry.get("torch")()
 
-    perf(
-        lambda: reject_sampling(target_logits, draft_tokens, draft_probs),
-        reference_executor=lambda: ref_reject_sampling(target_logits, draft_tokens, draft_probs),
-    )  # noqa: F821
+    perf(lambda: reject_sampling(target_logits, draft_tokens, draft_probs))  # noqa: F821

@@ -38,6 +38,7 @@ jobs:
         shell: bash
         run: |
           export HTTP_PROXY=${MOJO_OPSET_PROXY} HTTPS_PROXY=${MOJO_OPSET_PROXY}
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
           pip install -U pip setuptools wheel build pytest-xdist
           pip install -e .\[npu\] --index-url https://bytedpypi.byted.org/simple
           python3 -m build .
